@@ -5,7 +5,23 @@
 # ----------------------------
 
 PYTHON        ?= python3
+# Virtual environment
+VENV_DIR := .venv
+VENV_PY  := $(VENV_DIR)/bin/python
+REQUIREMENTS := requirements.txt
 
+# Rule: ensure venv exists and requirements installed
+$(VENV_PY): $(REQUIREMENTS)
+	@echo "[venv] Creating virtual environment..."
+	$(PYTHON) -m venv $(VENV_DIR)
+	@echo "[venv] Installing requirements..."
+	@$(VENV_PY) -m pip install --upgrade pip
+	@if [ -s $(REQUIREMENTS) ]; then \
+		$(VENV_PY) -m pip install -r $(REQUIREMENTS); \
+	else \
+		echo "[venv] requirements.txt is empty, skipping package install."; \
+	fi
+	
 # OSRM bits
 OSRM_PORT     ?= 5001
 OSRM_PROFILE  ?= $(shell brew --prefix osrm-backend)/share/osrm/profiles/car.lua
@@ -24,7 +40,7 @@ OSRM_CELLS    := $(OSRM_DIR)/canada-251027.osrm.cells
 REGIONS_GEOJSON := data/raw/Canada-20-subdivisions.geojson
 ROADS_GJ        := data/network/roads_ferries_drivable.geojsonl
 BORDERS_CSV     := data/crossings/cleaned_up_border_crossings.csv
-STARTS_CSV      := data/config/starts.csv
+STARTS_CSV      := data/config/starts_shortened.csv
 AVG_TIMES_CSV   := output/avg_times_by_region.csv
 
 # ----------------------------
@@ -103,11 +119,11 @@ $(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py
 # ----------------------------
 
 # Compute travel times from all starts in starts.csv using OSRM + boundary crossings
-times: $(AVG_TIMES_CSV)
+times: $(VENV_PY) $(AVG_TIMES_CSV)
 
 $(AVG_TIMES_CSV): $(BORDERS_CSV) $(STARTS_CSV) scripts/travel_times_from_point.py | dirs
 	@echo "[times] Computing OSRM travel times from starts in $(STARTS_CSV)..."
-	$(PYTHON) scripts/travel_times_from_point.py \
+	$(VENV_PY) scripts/travel_times_from_point.py \
 	  --borders-csv "$(BORDERS_CSV)" \
 	  --starts-csv "$(STARTS_CSV)" \
 	  --osrm-url "http://127.0.0.1:$(OSRM_PORT)" \

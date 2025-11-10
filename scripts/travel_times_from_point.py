@@ -10,6 +10,8 @@ Two modes:
   1) Single-start mode (backwards-compatible):
        python3 travel_times_from_point.py \
          --borders-csv boundary_crossings.csv \
+         --regions Canada.geojson \
+         --section-field CDNAME \
          --start-lat 44.6488 \
          --start-lon -63.5753 \
          --start-name "Halifax, NS" \
@@ -21,13 +23,16 @@ Two modes:
   2) Multi-start mode (NEW):
        python3 travel_times_from_point.py \
          --borders-csv boundary_crossings.csv \
+         --regions Canada.geojson \
+         --section-field CDNAME \
          --starts-csv starts.csv \
          --osrm-url http://127.0.0.1:5001 \
          --out avg_times_by_region.csv
 
      where starts.csv has columns: name,lat,lon
 
-     Output: one row per (start, region) pair, like single-start mode but repeated for each start, plus a final summary row per start giving the average road time from that start to all reachable regions (to_region="__AVERAGE__").
+     Output: one row per (start, region) pair, plus console summaries of
+     average travel times per start.
 
 Border CSV format:
   - expected columns (any of these variants):
@@ -37,43 +42,46 @@ Border CSV format:
         longitude    / lon
 
 Each border crossing point is associated with both regions that share it.
+
+Additionally, if --regions/--section-field are provided, each start point is
+classified into a region via Canada.geojson, and travel time to that "home"
+region is forced to 0 (you are already there) without calling OSRM for that region.
 """
 
 import sys
 import csv
 import math
 import argparse
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import requests
 import time
+
 try:
     from tqdm import tqdm  # type: ignore
 except Exception:
     tqdm = None
+
+# Shapely for region classification (Canada.geojson)
+try:
+    from shapely.geometry import shape, Point, Polygon, MultiPolygon  # type: ignore
+    from shapely.prepared import prep  # type: ignore
+    from shapely.validation import make_valid  # type: ignore
+except Exception:
+    shape = None
+    Point = None
+    Polygon = None
+    MultiPolygon = None
+    prep = None
+    make_valid = None
 
 # --------------------------------------------------------------------
 # Distance helper
 # --------------------------------------------------------------------
 
 EARTH_R = 6371000.0  # metres
-
-
-# --------------------------------------------------------------------
-# Progress helpers
-# --------------------------------------------------------------------
-
-def _fmt_rate(done: int, start_ts: float) -> str:
-    dt = max(1e-6, time.time() - start_ts)
-    return f"{done/dt:,.1f}/s"
-
-def _print_progress_prefix(prefix: str, processed: int, total: int, start_ts: float):
-    pct = 100.0 * processed / total if total > 0 else 0.0
-    rate = _fmt_rate(processed, start_ts)
-    msg = f"{prefix} {processed:,}/{total:,} ({pct:5.1f}%)  |  {rate}"
-    sys.stderr.write("\r" + msg[:120].ljust(120))
-    sys.stderr.flush()
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -90,9 +98,135 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 # --------------------------------------------------------------------
-# Border crossings CSV loader
+# Progress helpers
 # --------------------------------------------------------------------
 
+def _fmt_rate(done: int, start_ts: float) -> str:
+    dt = max(1e-6, time.time() - start_ts)
+    return f"{done/dt:,.1f}/s"
+
+
+def _print_progress_prefix(prefix: str, processed: int, total: int, start_ts: float):
+    pct = 100.0 * processed / total if total > 0 else 0.0
+    rate = _fmt_rate(processed, start_ts)
+    msg = f"{prefix} {processed:,}/{total:,} ({pct:5.1f}%)  |  {rate}"
+    sys.stderr.write("\r" + msg[:120].ljust(120))
+    sys.stderr.flush()
+
+
+# --------------------------------------------------------------------
+# Regions (Canada.geojson) loader + start classification
+# --------------------------------------------------------------------
+
+def _fix_poly(g):
+    """Make invalid polygons valid, cheaply."""
+    try:
+        if g.is_valid:
+            return g
+        if make_valid is not None:
+            return make_valid(g)
+        return g.buffer(0)
+    except Exception:
+        return g
+
+
+def load_regions(geojson_path: Path, section_field: str):
+    """Load region polygons from Canada.geojson.
+
+    Returns:
+      polys: list of Polygon
+      names: list of region names (same length as polys)
+      preps: list of prepared geometries (or None if not available)
+    """
+    if shape is None:
+        raise SystemExit(
+            "[regions] Shapely is required to classify starts into regions; please install shapely."
+        )
+
+    with geojson_path.open("r", encoding="utf-8") as fp:
+        feats = json.load(fp)
+
+    polys: List[Polygon] = []
+    names: List[str] = []
+
+    for f in feats.get("features", []):
+        props = f.get("properties", {}) or {}
+        nm = str(
+            props.get(section_field)
+            or props.get("name")
+            or props.get("NAME")
+            or "unknown"
+        )
+        geom = f.get("geometry")
+        if not geom:
+            continue
+        try:
+            g = shape(geom)
+        except Exception:
+            continue
+        if g.is_empty:
+            continue
+
+        if isinstance(g, MultiPolygon):
+            for part in g.geoms:
+                polys.append(_fix_poly(part))
+                names.append(nm)
+        elif isinstance(g, Polygon):
+            polys.append(_fix_poly(g))
+            names.append(nm)
+        else:
+            # Ignore non-area geometries
+            continue
+
+    if not polys:
+        raise SystemExit(f"[regions] No polygons loaded from {geojson_path}")
+
+    preps = [prep(p) if prep is not None else None for p in polys]
+
+    # For logging: distinct region names
+    uniq = []
+    seen = set()
+    for nm in names:
+        if nm not in seen:
+            seen.add(nm)
+            uniq.append(nm)
+    sys.stderr.write(
+        f"[regions] Loaded {len(uniq)} named regions from {geojson_path}: "
+        + ", ".join(uniq)
+        + "\n"
+    )
+    sys.stderr.flush()
+
+    return polys, names, preps
+
+
+def region_for_point(
+    lat: float,
+    lon: float,
+    polys: List[Polygon],
+    names: List[str],
+    preps,
+) -> Optional[str]:
+    """Return the name of the first region whose polygon contains the point."""
+    if Point is None:
+        return None
+    pt = Point(lon, lat)
+    for i, poly in enumerate(polys):
+        try:
+            if preps[i] is not None:
+                if preps[i].contains(pt):
+                    return names[i]
+            else:
+                if poly.contains(pt):
+                    return names[i]
+        except Exception:
+            continue
+    return None
+
+
+# --------------------------------------------------------------------
+# Border crossings CSV loader
+# --------------------------------------------------------------------
 
 def load_border_points(csv_path: Path) -> Dict[str, List[Tuple[float, float]]]:
     """Load border crossing points from a CSV into a map:
@@ -141,7 +275,12 @@ def load_border_points(csv_path: Path) -> Dict[str, List[Tuple[float, float]]]:
                 pbar.update(1)
             else:
                 if total_rows > 0 and row_idx % 1000 == 0:
-                    _print_progress_prefix("[borders] loading border points...", row_idx, total_rows, start_ts)
+                    _print_progress_prefix(
+                        "[borders] loading border points...",
+                        row_idx,
+                        total_rows,
+                        start_ts,
+                    )
 
             fp = (
                 row.get("from_section")
@@ -178,7 +317,12 @@ def load_border_points(csv_path: Path) -> Dict[str, List[Tuple[float, float]]]:
         if pbar is not None:
             pbar.close()
         elif total_rows > 0:
-            _print_progress_prefix("[borders] loading border points...", row_idx, total_rows, start_ts)
+            _print_progress_prefix(
+                "[borders] loading border points...",
+                row_idx,
+                total_rows,
+                start_ts,
+            )
             sys.stderr.write("\n")
             sys.stderr.flush()
 
@@ -195,7 +339,6 @@ def load_border_points(csv_path: Path) -> Dict[str, List[Tuple[float, float]]]:
 # --------------------------------------------------------------------
 # Starts CSV loader (multi-start mode)
 # --------------------------------------------------------------------
-
 
 def load_starts_csv(csv_path: Path) -> List[Tuple[str, float, float]]:
     """Load multiple start points from a CSV.
@@ -236,7 +379,6 @@ def load_starts_csv(csv_path: Path) -> List[Tuple[str, float, float]]:
 # --------------------------------------------------------------------
 # OSRM routing helper
 # --------------------------------------------------------------------
-
 
 def osrm_route(
     osrm_url: str,
@@ -331,6 +473,7 @@ def compute_times_for_start(
     start_lon: float,
     border_map: Dict[str, List[Tuple[float, float]]],
     osrm_url: str,
+    home_region: Optional[str] = None,
     snap_max_km: float = 50.0,
     start_snap_max_km: float = 50.0,
 ) -> Dict[str, Tuple[float, float, float, float, str, float, float]]:
@@ -354,11 +497,9 @@ def compute_times_for_start(
     regions = sorted(border_map.keys())
 
     total_regions = len(regions)
-    # Total number of candidate border points across all regions
     total_points = sum(len(border_map[nm]) for nm in regions)
     processed_points = 0
 
-    # Fancy progress bar (tqdm) if available + TTY; else manual single-line progress
     use_tqdm = (tqdm is not None) and sys.stderr.isatty() and total_points > 0
     pbar = None
     start_ts = time.time()
@@ -377,8 +518,35 @@ def compute_times_for_start(
 
     for nm in regions:
         done_regions += 1
-
         cand_points = border_map[nm]
+
+        # If this region is the start's home region, force 0 travel time and skip OSRM.
+        if home_region and nm == home_region:
+            # Still count its candidate points toward the global progress, so percentages stay correct.
+            for _ in cand_points:
+                processed_points += 1
+                if use_tqdm:
+                    pbar.update(1)
+                    if processed_points % 10 == 0 or processed_points == total_points:
+                        pbar.set_postfix(regions=f"{done_regions}/{total_regions}")
+                else:
+                    if total_points > 0 and processed_points % 20 == 0:
+                        pct = 100.0 * processed_points / total_points
+                        sys.stderr.write(
+                            f"\r[osrm] {start_name}: {done_regions}/{total_regions} regions ({pct:5.1f}%)"
+                        )
+                        sys.stderr.flush()
+
+            results[nm] = (
+                0.0,       # straight_km
+                0.0,       # road_km
+                0.0,       # t_sec
+                0.0,       # t_h
+                "0h 00m",  # t_str
+                start_lat,
+                start_lon,
+            )
+            continue
 
         best_t_sec: Optional[float] = None
         best_road_km: float = math.nan
@@ -387,17 +555,13 @@ def compute_times_for_start(
         best_straight_km: float = math.nan
 
         for idx, (cand_lat, cand_lon) in enumerate(cand_points, start=1):
-            # Count this candidate as “processed” for progress purposes
             processed_points += 1
 
             if use_tqdm:
-                # tqdm bar: percent comes from processed_points / total_points
                 pbar.update(1)
-                # show how many regions we’ve worked through in the postfix
                 if processed_points % 10 == 0 or processed_points == total_points:
                     pbar.set_postfix(regions=f"{done_regions}/{total_regions}")
             else:
-                # Manual single-line progress when tqdm isn't active
                 if total_points > 0 and processed_points % 20 == 0:
                     pct = 100.0 * processed_points / total_points
                     sys.stderr.write(
@@ -415,19 +579,25 @@ def compute_times_for_start(
                     cand_lat,
                 )
             except Exception:
-                # Only warn later if *all* candidates fail
                 continue
 
             # Check how far OSRM snapped the *start* point onto the road graph.
-            start_snap_delta_km = haversine_m(start_lat, start_lon, s_start_lat, s_start_lon) / 1000.0
+            start_snap_delta_km = (
+                haversine_m(start_lat, start_lon, s_start_lat, s_start_lon) / 1000.0
+            )
             if start_snap_delta_km_first is None:
                 start_snap_delta_km_first = start_snap_delta_km
                 if start_snap_delta_km_first > start_snap_max_km:
-                    # This start is effectively off the drivable network; abort this start entirely.
+                    # This start is effectively off the drivable network.
                     sys.stderr.write(
-                        f"\n[warn] Start '{start_name}' appears {start_snap_delta_km_first:.1f} km from nearest road; skipping road routing for this start.\n"
+                        f"\n[warn] Start '{start_name}' appears "
+                        f"{start_snap_delta_km_first:.1f} km from nearest road; "
+                        "skipping road routing for this start.\n"
                     )
                     sys.stderr.flush()
+                    # If we already have a home-region zero entry, keep only that.
+                    if home_region and home_region in results:
+                        return {home_region: results[home_region]}
                     return {}
 
             # Sanity-check snap distance at the *end* (border point) to guard against silly ferry midpoints.
@@ -439,8 +609,7 @@ def compute_times_for_start(
             if best_t_sec is None or t_sec_c < best_t_sec:
                 best_t_sec = t_sec_c
                 best_road_km = road_km_c
-                # Keep logical border-crossing coordinate from CSV
-                best_lat = cand_lat
+                best_lat = cand_lat   # keep logical border-crossing coordinate from CSV
                 best_lon = cand_lon
                 best_straight_km = straight_km
 
@@ -465,10 +634,8 @@ def compute_times_for_start(
 
     # Finish progress display nicely
     if use_tqdm and pbar is not None:
-        # tqdm already showed a nice progress bar; just close it.
         pbar.close()
     elif total_points > 0:
-        # Fallback manual summary when tqdm is not used
         pct = 100.0 * processed_points / total_points
         sys.stderr.write(
             f"\r[osrm] {start_name}: {total_regions}/{total_regions} regions ({pct:5.1f}%)\n"
@@ -476,10 +643,11 @@ def compute_times_for_start(
         sys.stderr.flush()
 
     return results
+
+
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
-
 
 def main():
     ap = argparse.ArgumentParser(
@@ -492,6 +660,15 @@ def main():
         "--borders-csv",
         required=True,
         help="CSV of inter-regional crossings (from_section,to_section,latitude,longitude,...)",
+    )
+    ap.add_argument(
+        "--regions",
+        help="Canada.geojson-style polygons used to detect which region a start lies in",
+    )
+    ap.add_argument(
+        "--section-field",
+        default="CDNAME",
+        help="Property name in regions GeoJSON for region names (e.g. CDNAME or CNAME)",
     )
     # Single-start options (backwards compatible)
     ap.add_argument(
@@ -522,7 +699,7 @@ def main():
     ap.add_argument(
         "--out",
         required=True,
-        help="Output CSV (single-start: per-region times; multi-start: average per region)",
+        help="Output CSV (single-start: per-region times; multi-start: per-start per-region times)",
     )
 
     args = ap.parse_args()
@@ -532,6 +709,30 @@ def main():
 
     if not borders_path.exists():
         raise SystemExit(f"[borders] File not found: {borders_path}")
+
+    # Optional regions for classifying starts
+    polys = None
+    region_names = None
+    preps = None
+    if args.regions:
+        regions_path = Path(args.regions)
+        if not regions_path.exists():
+            sys.stderr.write(f"[regions] WARNING: regions file not found: {regions_path}, skipping start classification\n")
+            sys.stderr.flush()
+        else:
+            polys, region_names, preps = load_regions(regions_path, args.section_field)
+
+    def detect_home_region(name: str, lat: float, lon: float) -> Optional[str]:
+        if polys is None or region_names is None:
+            return None
+        nm = region_for_point(lat, lon, polys, region_names, preps)
+        if nm:
+            sys.stderr.write(f"[regions] Start '{name}' classified into region: {nm}\n")
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(f"[regions] Start '{name}' not inside any region polygon\n")
+            sys.stderr.flush()
+        return nm
 
     # 1) Load border points
     border_map = load_border_points(borders_path)
@@ -556,8 +757,10 @@ def main():
         all_rows = []
         avg_times_summary = []
         for idx, (name, s_lat, s_lon) in enumerate(starts, start=1):
+            home_region = detect_home_region(name, s_lat, s_lon)
             sys.stderr.write(
-                f"[info] Start {idx}/{total_starts}: {name} at ({s_lat:.4f}, {s_lon:.4f}), OSRM {args.osrm_url}\n"
+                f"[info] Start {idx}/{total_starts}: {name} at ({s_lat:.4f}, {s_lon:.4f}), "
+                f"home_region={home_region or 'unknown'}, OSRM {args.osrm_url}\n"
             )
             sys.stderr.flush()
 
@@ -567,6 +770,7 @@ def main():
                 s_lon,
                 border_map,
                 args.osrm_url,
+                home_region=home_region,
             )
 
             rows_for_start = []
@@ -585,36 +789,27 @@ def main():
                             end_lon,
                         )
                     )
-            # sort rows for this start by increasing road time (NaNs already filtered)
+
             def _sort_key_start(r):
                 return r[4]  # t_sec
+
             rows_for_start.sort(key=_sort_key_start)
 
             if rows_for_start:
-                # Total reachable regions for this start
                 n_regions = len(rows_for_start)
-
-                # Average over all reachable regions (used for global best/worst summary)
                 avg_sec_all = sum(r[4] for r in rows_for_start) / n_regions
                 avg_str_all = format_time_h_m(avg_sec_all)
 
-                # Append detailed rows for this start only (no summary rows in CSV)
                 all_rows.extend(rows_for_start)
-
-                # Track per-start averages for global summary (still based on ALL reachable regions)
                 avg_times_summary.append((name, avg_sec_all, avg_str_all))
 
-                # Compute prefix averages for fastest k regions, for k = N, N-1, ..., 3
-                # rows_for_start is already sorted by increasing travel time.
                 prefix_parts = []
-                # We already have the average for all N; start from N-1 down to 3
                 for k in range(n_regions - 1, 2, -1):
                     subset = rows_for_start[:k]
                     avg_sec_k = sum(r[4] for r in subset) / k
                     avg_str_k = format_time_h_m(avg_sec_k)
                     prefix_parts.append(f"{k}:{avg_str_k}")
 
-                # Build a compact one-line summary for this start
                 if prefix_parts:
                     prefix_str = ", ".join(prefix_parts)
                     msg = (
@@ -622,7 +817,6 @@ def main():
                         f"fastest-k averages (k:time) -> {prefix_str}\n"
                     )
                 else:
-                    # Fallback when very few regions are reachable (<= 3)
                     msg = f"[avg] {name}: all {n_regions}: {avg_str_all}\n"
 
                 sys.stderr.write(msg)
@@ -666,7 +860,7 @@ def main():
         return
 
     # ----------------------
-    # Single-start mode (original behaviour)
+    # Single-start mode
     # ----------------------
     if args.start_lat is None or args.start_lon is None:
         raise SystemExit(
@@ -676,8 +870,11 @@ def main():
     start_lat = args.start_lat
     start_lon = args.start_lon
 
+    home_region = detect_home_region(args.start_name, start_lat, start_lon)
+
     sys.stderr.write(
-        f"[info] Start: {args.start_name} at ({start_lat:.4f}, {start_lon:.4f}), OSRM {args.osrm_url}\n"
+        f"[info] Start: {args.start_name} at ({start_lat:.4f}, {start_lon:.4f}), "
+        f"home_region={home_region or 'unknown'}, OSRM {args.osrm_url}\n"
     )
     sys.stderr.flush()
 
@@ -687,9 +884,9 @@ def main():
         start_lon,
         border_map,
         args.osrm_url,
+        home_region=home_region,
     )
 
-    # Turn dict into sortable rows
     rows = []
     for nm, (
         straight_km,
@@ -714,7 +911,6 @@ def main():
             )
         )
 
-    # Sort by increasing road time (NaNs last)
     def _sort_key_single(r):
         t_sec = r[4]
         if not isinstance(t_sec, (int, float)) or math.isnan(t_sec):
@@ -723,7 +919,6 @@ def main():
 
     rows.sort(key=_sort_key_single)
 
-    # Write per-region CSV
     with out_csv.open("w", newline="", encoding="utf-8") as fp:
         wr = csv.writer(fp)
         wr.writerow(

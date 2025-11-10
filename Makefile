@@ -5,23 +5,12 @@
 # ----------------------------
 
 PYTHON        ?= python3
-# Virtual environment
-VENV_DIR := .venv
-VENV_PY  := $(VENV_DIR)/bin/python
-REQUIREMENTS := requirements.txt
 
-# Rule: ensure venv exists and requirements installed
-$(VENV_PY): $(REQUIREMENTS)
-	@echo "[venv] Creating virtual environment..."
-	$(PYTHON) -m venv $(VENV_DIR)
-	@echo "[venv] Installing requirements..."
-	@$(VENV_PY) -m pip install --upgrade pip
-	@if [ -s $(REQUIREMENTS) ]; then \
-		$(VENV_PY) -m pip install -r $(REQUIREMENTS); \
-	else \
-		echo "[venv] requirements.txt is empty, skipping package install."; \
-	fi
-	
+# Virtual environment
+VENV_DIR      := .venv
+VENV_PY       := $(VENV_DIR)/bin/python
+REQUIREMENTS  := requirements.txt
+
 # OSRM bits
 OSRM_PORT     ?= 5001
 OSRM_PROFILE  ?= $(shell brew --prefix osrm-backend)/share/osrm/profiles/car.lua
@@ -47,14 +36,32 @@ AVG_TIMES_CSV   := output/avg_times_by_region.csv
 # Phony targets
 # ----------------------------
 
-.PHONY: all dirs osrm-prep osrm-all osrm osrm-forever borders times clean
+.PHONY: all dirs osrm-prep osrm-all osrm osrm-forever borders times clean venv
 
 # Default: build borders + times (assumes OSRM server is already running)
 all: borders times
 
 # Ensure directory structure exists
 dirs:
-	mkdir -p scripts data/raw data/network data/config output data/osrm
+	mkdir -p scripts data/raw data/network data/config data/crossings output data/osrm
+
+# ----------------------------
+# Virtual env + deps
+# ----------------------------
+
+venv: $(VENV_PY)
+
+# ensure venv exists and requirements installed
+$(VENV_PY): $(REQUIREMENTS)
+	@echo "[venv] Creating virtual environment..."
+	$(PYTHON) -m venv $(VENV_DIR)
+	@echo "[venv] Installing requirements..."
+	@$(VENV_PY) -m pip install --upgrade pip
+	@if [ -s $(REQUIREMENTS) ]; then \
+		$(VENV_PY) -m pip install -r $(REQUIREMENTS); \
+	else \
+		echo "[venv] requirements.txt is empty, skipping package install."; \
+	fi
 
 # ----------------------------
 # OSRM: prepare graph data
@@ -68,7 +75,7 @@ osrm-prep: $(OSRM_CELLS)
 osrm-all: osrm-prep
 	@echo "[osrm] OSRM dataset ready at $(OSRM_OSRM)"
 
-# Extract base .osrm from PBF (and sidecar .osrm.* files) into data/raw
+# Extract base .osrm from PBF (and sidecar .osrm.* files) into data/raw, then move into data/osrm
 $(OSRM_OSRM): $(RAW_OSM) | dirs
 	@echo "[osrm] Extracting from $(RAW_OSM) using profile $(OSRM_PROFILE)..."
 	# 1) Let OSRM write all .osrm* next to the PBF in data/raw
@@ -104,11 +111,11 @@ osrm: osrm-prep
 # ----------------------------
 
 # Generate boundary_crossings.csv from drivable network
-borders: $(BORDERS_CSV)
+borders: $(VENV_PY) $(BORDERS_CSV)
 
 $(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py | dirs
 	@echo "[borders] Computing boundary crossings..."
-	$(PYTHON) scripts/find_boundry_crossings.py \
+	$(VENV_PY) scripts/find_boundry_crossings.py \
 	  --regions "$(REGIONS_GEOJSON)" \
 	  --section-field CNAME \
 	  --roads "$(ROADS_GJ)" \
@@ -118,14 +125,14 @@ $(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py
 # Travel times (OSRM-based)
 # ----------------------------
 
-# Compute travel times from all starts in starts.csv using OSRM + boundary crossings
-times: $(VENV_PY) $(AVG_TIMES_CSV)
-
-$(AVG_TIMES_CSV): $(BORDERS_CSV) $(STARTS_CSV) scripts/travel_times_from_point.py | dirs
+# Always recompute travel times when you run `make times`
+times: venv borders | dirs
 	@echo "[times] Computing OSRM travel times from starts in $(STARTS_CSV)..."
 	$(VENV_PY) scripts/travel_times_from_point.py \
 	  --borders-csv "$(BORDERS_CSV)" \
 	  --starts-csv "$(STARTS_CSV)" \
+	  --regions "$(REGIONS_GEOJSON)" \
+	  --section-field CDNAME \
 	  --osrm-url "http://127.0.0.1:$(OSRM_PORT)" \
 	  --out "$(AVG_TIMES_CSV)"
 

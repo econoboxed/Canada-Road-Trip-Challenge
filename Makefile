@@ -1,8 +1,5 @@
-# Makefile for road-border project + OSRM
-
-# ----------------------------
-# Configurable variables
-# ----------------------------
+.SILENT:
+MAKEFLAGS += --no-print-directory --silent
 
 PYTHON        ?= python3
 
@@ -29,7 +26,7 @@ OSRM_CELLS    := $(OSRM_DIR)/canada-251027.osrm.cells
 REGIONS_GEOJSON := data/raw/Canada-20-subdivisions.geojson
 ROADS_GJ        := data/network/roads_ferries_drivable.geojsonl
 BORDERS_CSV     := data/crossings/cleaned_up_border_crossings.csv
-STARTS_CSV      := data/config/starts_shortened.csv
+STARTS_CSV      := data/config/starts.csv
 AVG_TIMES_CSV   := output/avg_times_by_region.csv
 
 # ----------------------------
@@ -53,14 +50,10 @@ venv: $(VENV_PY)
 
 # ensure venv exists and requirements installed
 $(VENV_PY): $(REQUIREMENTS)
-	@echo "[venv] Creating virtual environment..."
-	$(PYTHON) -m venv $(VENV_DIR)
-	@echo "[venv] Installing requirements..."
-	@$(VENV_PY) -m pip install --upgrade pip
+	@$(PYTHON) -m venv $(VENV_DIR) >/dev/null 2>&1
+	@$(VENV_PY) -m pip install --upgrade pip >/dev/null 2>&1
 	@if [ -s $(REQUIREMENTS) ]; then \
-		$(VENV_PY) -m pip install -r $(REQUIREMENTS); \
-	else \
-		echo "[venv] requirements.txt is empty, skipping package install."; \
+		$(VENV_PY) -m pip install -r $(REQUIREMENTS) >/dev/null 2>&1; \
 	fi
 
 # ----------------------------
@@ -114,7 +107,6 @@ osrm: osrm-prep
 borders: $(VENV_PY) $(BORDERS_CSV)
 
 $(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py | dirs
-	@echo "[borders] Computing boundary crossings..."
 	$(VENV_PY) scripts/find_boundry_crossings.py \
 	  --regions "$(REGIONS_GEOJSON)" \
 	  --section-field CNAME \
@@ -127,14 +119,13 @@ $(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py
 
 # Always recompute travel times when you run `make times`
 times: venv borders | dirs
-	@echo "[times] Computing OSRM travel times from starts in $(STARTS_CSV)..."
 	$(VENV_PY) scripts/travel_times_from_point.py \
 	  --borders-csv "$(BORDERS_CSV)" \
 	  --starts-csv "$(STARTS_CSV)" \
-	  --regions "$(REGIONS_GEOJSON)" \
-	  --section-field CDNAME \
 	  --osrm-url "http://127.0.0.1:$(OSRM_PORT)" \
-	  --out "$(AVG_TIMES_CSV)"
+	  --out "$(AVG_TIMES_CSV)" \
+	  --section-field CDNAME \
+	  --regions data/raw/Canada-20-subdivisions.geojson
 
 # ----------------------------
 # Cleanup

@@ -23,20 +23,25 @@ OSRM_PART     := $(OSRM_DIR)/canada-251027.osrm.partition
 OSRM_CELLS    := $(OSRM_DIR)/canada-251027.osrm.cells
 
 # Project data
-REGIONS_GEOJSON := data/raw/Canada-20-subdivisions.geojson
+TWENTY_REGIONS_GEOJSON := data/raw/Canada-20-Subdivisions.geojson
+THIRTEEN_REGIONS_GEOJSON := data/raw/Canada-13-Subdivisions.geojson
 ROADS_GJ        := data/network/roads_ferries_drivable.geojsonl
-BORDERS_CSV     := data/crossings/cleaned_up_border_crossings.csv
+THIRTEEN_BORDERS_CSV     := data/crossings/13-subdivisions-crossings.csv
+TWENTY_BORDERS_CSV     := data/crossings/20-subdivisions-crossings.csv
+THIRTEEN_BORDERS_OUT_CSV     := data/crossings/13-subdivisions-crossings_raw.csv
+TWENTY_BORDERS_OUT_CSV     := data/crossings/20-subdivisions-crossings_raw.csv
 STARTS_CSV      := data/config/starts.csv
-AVG_TIMES_CSV   := output/avg_times_by_region.csv
+AVG_TIMES_20_CSV   := output/avg_times_20_regions.csv
+AVG_TIMES_13_CSV   := output/avg_times_13_regions.csv
 
 # ----------------------------
 # Phony targets
 # ----------------------------
 
-.PHONY: all dirs osrm-prep osrm-all osrm osrm-forever borders times clean venv
+.PHONY: all dirs osrm-prep osrm-all osrm osrm-forever borders times clean venv borders-20 borders-13 times-20 times-13
 
 # Default: build borders + times (assumes OSRM server is already running)
-all: borders times
+all: borders-20 borders-13 times-20 times-13
 
 # Ensure directory structure exists
 dirs:
@@ -103,29 +108,49 @@ osrm: osrm-prep
 # Boundary crossings
 # ----------------------------
 
-# Generate boundary_crossings.csv from drivable network
-borders: $(VENV_PY) $(BORDERS_CSV)
+borders: borders-20
 
-$(BORDERS_CSV): $(ROADS_GJ) $(REGIONS_GEOJSON) scripts/find_boundry_crossings.py | dirs
+borders-20: venv $(TWENTY_BORDERS_CSV)
+
+$(TWENTY_BORDERS_CSV): $(ROADS_GJ) $(TWENTY_REGIONS_GEOJSON) scripts/find_boundry_crossings.py | dirs
 	$(VENV_PY) scripts/find_boundry_crossings.py \
-	  --regions "$(REGIONS_GEOJSON)" \
+	  --regions "$(TWENTY_REGIONS_GEOJSON)" \
 	  --section-field CNAME \
 	  --roads "$(ROADS_GJ)" \
-	  --out "$(BORDERS_CSV)"
+	  --out "$(TWENTY_BORDERS_OUT_CSV)"
+
+borders-13: venv $(THIRTEEN_BORDERS_CSV)
+
+$(THIRTEEN_BORDERS_CSV): $(ROADS_GJ) $(THIRTEEN_REGIONS_GEOJSON) scripts/find_boundry_crossings.py | dirs
+	$(VENV_PY) scripts/find_boundry_crossings.py \
+	  --regions "$(THIRTEEN_REGIONS_GEOJSON)" \
+	  --section-field CNAME \
+	  --roads "$(ROADS_GJ)" \
+	  --out "$(THIRTEEN_BORDERS_OUT_CSV)"
 
 # ----------------------------
 # Travel times (OSRM-based)
 # ----------------------------
 
-# Always recompute travel times when you run `make times`
-times: venv borders | dirs
+times: times-20
+
+times-20: venv borders-20 | dirs
 	$(VENV_PY) scripts/travel_times_from_point.py \
-	  --borders-csv "$(BORDERS_CSV)" \
+	  --borders-csv "$(TWENTY_BORDERS_CSV)" \
 	  --starts-csv "$(STARTS_CSV)" \
 	  --osrm-url "http://127.0.0.1:$(OSRM_PORT)" \
-	  --out "$(AVG_TIMES_CSV)" \
+	  --out "$(AVG_TIMES_20_CSV)" \
 	  --section-field CDNAME \
-	  --regions data/raw/Canada-20-subdivisions.geojson
+	  --regions "$(TWENTY_REGIONS_GEOJSON)"
+
+times-13: venv borders-13 | dirs
+	$(VENV_PY) scripts/travel_times_from_point.py \
+	  --borders-csv "$(THIRTEEN_BORDERS_CSV)" \
+	  --starts-csv "$(STARTS_CSV)" \
+	  --osrm-url "http://127.0.0.1:$(OSRM_PORT)" \
+	  --out "$(AVG_TIMES_13_CSV)" \
+	  --section-field CDNAME \
+	  --regions "$(THIRTEEN_REGIONS_GEOJSON)"
 
 # ----------------------------
 # Cleanup
@@ -133,4 +158,4 @@ times: venv borders | dirs
 
 clean:
 	@echo "[clean] Removing generated outputs (not raw data or OSRM graph)..."
-	rm -f "$(BORDERS_CSV)" "$(AVG_TIMES_CSV)" output/times_from_*_border.csv
+	rm -f "$(THIRTEEN_BORDERS_CSV)" "$(TWENTY_BORDERS_CSV)" "$(AVG_TIMES_13_CSV)" "$(AVG_TIMES_20_CSV)" output/times_from_*_border.csv
